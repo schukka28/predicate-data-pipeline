@@ -24,6 +24,7 @@ fetch:
   keep_pdfs: true              # false = delete each PDF once its text is cached (saves disk)
 
 text:
+  backend: pdftotext           # pdftotext (poppler + tesseract) | pymupdf (PyMuPDF + RapidOCR on GPU; see config/pymupdf.yaml)
   workers: 0                   # 0 = all CPU cores
   max_pages: 40                # only the first N pages are read/OCR'd (summary is near the front)
   ocr:

@@ -3,9 +3,10 @@
 secrets/
 .venv/
 
-# raw and derived data (hundreds of MB to 34 GB); see README "Data bundle" and the Drive folder fdasearch_data_v2
+# raw and derived data (hundreds of MB to 34 GB); see README "Data bundle" and the Drive folder fdasearch_data_v3
 data/
 bundle/
+bundle_v3/
 bundle_emb_cache/
 *.log
 
@@ -15,6 +16,9 @@ results/top/
 results/ranks/
 results_v1/ranks/
 results_v1/top/
+results_v2/ranks/
+results_v2/top/
+results_v2/emb/
 results/reference/
 
 # python / editor

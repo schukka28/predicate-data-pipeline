@@ -1,0 +1,12 @@
+# GPU extraction backend (used by fdasearch): PyMuPDF text layer + RapidOCR on ONNX Runtime CUDA for image-only pages.
+# No poppler/tesseract needed. See predx/pdftext_pymupdf.py.
+#
+#   python -m predx.cli --config config/pymupdf.yaml --set paths.data_dir=/path/to/data text --queue all
+#
+text:
+  backend: pymupdf
+  workers: 8                   # each worker owns one RapidOCR session on the GPU (~0.5 GB); 8 saturate an RTX 4090
+  ocr:
+    dpi: 150                   # measured: 0.65 s/page on a 4090 at 150 dpi, and the K-numbers read correctly on the label check
+    max_pages: 12              # scanned pre-2010 summaries are short; the decision letter + IFU form + summary fit in 12 pages
+    rec_model: "SWHL/RapidOCR:PP-OCRv3/en_PP-OCRv3_rec_infer.onnx"   # English recognizer (keeps word spaces); "" = RapidOCR's bundled ch+en model

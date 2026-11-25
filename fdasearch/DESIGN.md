@@ -1,135 +1,126 @@
 # fdasearch design
 
-2026-11-21 · Keyvan Azami (with Claude Code). Living copy: https://claude.ai/artifact/A4s1wKE1N661PFdsZhALsB
+2026-11-22 · Keyvan Azami (with Claude Code). Living copy: https://claude.ai/artifact/A4s1wKE1N661PFdsZhALsB
 
 ## Goal
 
-fdasearch turns the public FDA 510(k) record into a predicate-retrieval benchmark and measures how well untuned search methods solve it. Given a new device's text (name, Indications for Use, device description), the system must rank the 49,238 earlier clearances so that the predicates its 510(k) summary cites come first. The project delivers the dataset (v2, in the team's `predx` layout), 16 zero-shot baselines with confidence intervals, and a Colab notebook that reruns everything from a data bundle on Google Drive.
+Measure how well untuned search methods solve 510(k) predicate retrieval on the dataset built by the team's `predx` pipeline. Given a new device's Indications for Use and Device Description, a method must rank the 52,123 earlier clearances in the corpus so that the predicates its 510(k) summary cites come first. These numbers are the zero-shot reference for the fine-tuned retriever.
 
-- **Query**: one 510(k) subject cleared in 2024 (dev) or 2025 to 2026 (test), its text with K-numbers masked and substantial-equivalence sentences removed.
-- **Candidates**: every corpus device cleared before the subject's decision date; optionally only those sharing its product code (`+pc`).
-- **Positives**: the K-numbers the subject's summary cites as predicates, when they are in the corpus. The first cited one is the primary predicate.
-- **Train split**: 25,847 subjects from 2010 to 2023 with 47,836 (query, predicate) pairs for fine-tuning; never evaluated on.
+- **Query**: one 510(k) subject cleared in 2024 (dev) or 2025 to 2026 (test). Text = Indications for Use + Device Description, with every K-number and the names of its cited predicates masked (`mask_level: standard`). The device name is not part of the query.
+- **Candidates**: every corpus device cleared strictly before the subject's decision date (`n_candidates`); optionally only those sharing its product code (`+pc`).
+- **Gold**: the K-numbers the subject's summary cites as predicates. predx gives each document exactly one **primary** predicate and any number of **additional** predicates; **reference** devices are never gold. Scores are reported twice: over all in-corpus gold (primary + additional) and for the primary predicate alone.
+- **Train split**: 22,580 retrievable subjects from 2015 to 2023 with 41,281 (subject, predicate) pairs for fine-tuning; never evaluated on.
+
+All definitions come from predx's `config/default.yaml`. fdasearch's own earlier pipeline (v1, v2) is retired; its results are kept in `results_v1/` and `results_v2/` for comparison only.
 
 ## System overview
 
 ```mermaid
 flowchart TB
-    A1["openFDA 510(k) export<br/>176k records, metadata"]
+    A1["openFDA 510(k) export<br/>176,683 records"]
     A2["accessdata.fda.gov<br/>summary PDFs by K-number"]
-    subgraph P["Data pipeline (scripts/)"]
+    subgraph P["predx (repo root)"]
         direction LR
-        B1["download_pdfs<br/>2010+ summaries, --panel filter"] --> B2["extract_text<br/>PyMuPDF + RapidOCR, cited K-numbers"] --> B3["fetch_closure<br/>cited predicates outside the window"] --> B4["build_dataset<br/>mask, strip SE text, train/dev/test"]
+        B1["meta, plan, fetch<br/>queues: subjects, closure"] --> B2["text<br/>backend pymupdf: PyMuPDF + RapidOCR GPU"] --> B3["parse<br/>sections, predicate roles"] --> B4["build, validate, audit<br/>mask, splits, gold, checks"]
     end
     A1 --> B1
     A2 --> B1
-    B4 --> C1["corpus.parquet<br/>49,238 docs 1985-2026, 934 OCR'd"]
-    B4 --> C2["queries.parquet<br/>train 25,847 / dev 2,445 / test 4,912"]
-    B4 --> C3["predx/ (export_predx)<br/>team layout, gold roles, 47,836 train pairs"]
-    subgraph E["Evaluation (results/)"]
+    B4 --> C1["dataset/corpus.jsonl.gz<br/>52,123 docs, 1993-2026"]
+    B4 --> C2["dataset/queries_*.jsonl.gz<br/>retrievable: train 22,580 / dev 2,635 / test 5,308"]
+    subgraph E["fdasearch/ (evaluation)"]
         direction LR
-        D1["run_baselines<br/>lexical, dense, RRF; +pc filter; top-100"] --> D2["metrics + ranks<br/>per-query ranks, bootstrap 95% CIs"] --> D3["summarize_results<br/>REPORT.md by panel and pool size"] --> D4["make_colab<br/>notebook from the scripts + metrics"]
+        D0["predx_dataset<br/>loader"] --> D1["run_baselines<br/>lexical, dense, RRF; +pc; top-100"] --> D2["summarize_results<br/>REPORT.md, all-gold and primary-only"] --> D3["make_colab<br/>notebook"]
     end
-    C1 --> D1
-    C2 --> D1
-    E1["bundle_build.sh<br/>670 MB from data/, results/; sha256 manifest"] --> E2["Google Drive<br/>fdasearch_data_v2 folder + the notebook"] --> E3["Colab notebook<br/>drive or fda data source; quick or full mode"]
-    D4 --> E3
+    C1 --> D0
+    C2 --> D0
+    E1["bundle_build.sh<br/>146 MB, sha256 manifest"] --> E2["Google Drive<br/>fdasearch_data_v3"] --> E3["Colab notebook<br/>drive or fda data source; quick or full"]
+    D3 --> E3
 ```
 
-Metadata and PDFs enter at the top, four scripts turn them into the corpus, query and predx files, the evaluation scripts score and report, and the bundle plus notebook let anyone rerun the lower half from Drive.
+## Data pipeline (predx)
 
-## Data pipeline
+| Stage | What it does | Output under the data root |
+| --- | --- | --- |
+| `meta` | Normalises the openFDA export | `meta/510k.jsonl.gz` |
+| `plan` | Writes K-number queues: `subjects` (substantially-equivalent decisions with a summary, 2015+), `closure` (predicates those subjects cite that are not yet fetched) | `queues/*.txt` |
+| `fetch` | Downloads summary PDFs, resumable, with a status log | `pdf/<yy>/K.pdf`, `fetch_status.jsonl` |
+| `text` | Page text; OCR for image-only or garbled pages | `text/<yy>/K.txt.gz`, `text_stats.jsonl` |
+| `parse` | Finds Indications for Use and Device Description; finds cited K-numbers and assigns roles | `parsed.jsonl.gz` |
+| `build` | Keeps documents with both sections, masks leakage, splits by decision year, computes gold and candidate counts | `dataset/` |
+| `validate`, `audit` | Invariants (dates, gold in corpus, no self-citation, nothing unmasked) and a PASS/WARN/FAIL report | `reports/audit.md` |
 
-Five scripts take the openFDA export to a leak-controlled dataset; each stage is resumable and writes one file the next stage reads.
+**What fdasearch added to predx.**
 
-| Stage | Script | Input | Output | Notes |
-| --- | --- | --- | --- | --- |
-| 1. Metadata + PDFs | `download_pdfs.py` | openFDA 510(k) export (176k records) | `data/pdfs/K######.pdf` for 2010+ summaries | Generic research User-Agent; ~25 PDFs/s with 6 workers; 0.6% have no PDF. `--panel` restricts to one advisory committee. |
-| 2. Text extraction | `extract_text.py` | PDFs | `data/extracted.jsonl` | PyMuPDF text; regex section headers for Indications for Use and Device Description; cited K-numbers labelled predicate or reference by nearby wording. Pages under 100 characters trigger RapidOCR on the GPU (150 dpi, first 12 pages, 0.65 s/page on the 4090). OCR recovered 775 of 990 scanned 2010+ summaries. |
-| 3. Closure fetch | `fetch_closure.py` | cited K-numbers missing from the corpus | `data/pdfs_closure/` + `extracted_closure.jsonl` | Pulls the mostly pre-2010 predicates the queries cite so they count as retrievable: 1,021 PDFs fetched, 298 not on the FDA server, 101 needed OCR. Single worker with back-off because FDA throttles bursts. |
-| 4. Dataset build | `build_dataset.py` | metadata + both extracted files | `data/corpus.parquet`, `data/queries.parquet` | Masks K-numbers, drops sentences mentioning predicates, substantial equivalence, 510(k) or reference devices (52,776 sentences), flags queries whose predicate's name appears verbatim (`leak_name`, 24%). Splits by decision year: train 2010-2023, dev 2024, test 2025+. |
-| 5. Team export | `export_predx.py` | the two parquet files | `data/predx/*.jsonl.gz`, `dataset_card.json` | The `predx` layout from the team notebook: corpus, per-split queries with gold roles (primary/additional), train pairs, dataset card. |
+- `text.backend: pymupdf` (`predx/pdftext_pymupdf.py`, `config/pymupdf.yaml`): PyMuPDF for the text layer and RapidOCR on the GPU for scanned pages, with the same on-disk format as the poppler + tesseract backend. 13,613 of 55,590 documents needed OCR on at least one page. The recogniser is the English PP-OCRv3 model, because RapidOCR's bundled model drops the spaces between English words and the heading rules need them.
+- `mask_k_numbers` now repeats until no K-number is left, which fixes numbers glued together such as `K140833K140833`.
+- `fdasearch/scripts/predx_bridge.py` hard-links PDFs that were already downloaded into the predx layout.
 
-Retrieval text per document is `device_name + IFU + description` (97% of docs); when neither section parses, the first 4,000 characters of the summary body stand in. Corpus v2 has 49,238 documents from 1985 to 2026, of which 934 are OCR'd. Dev and test queries find 96% and 97% of their cited predicates in the corpus; v1, which lacked closure and OCR, found about 82%.
+**Roles.** A document's primary predicate is, in order of preference: the one labelled primary in the summary (6,809 documents), the first K-number in the predicate section (40,404), or the first other K-number anywhere when no predicate section is found (2,145). 2,765 usable documents cite nothing.
+
+**Coverage.** FDA throttles bursts: the default 4 requests per second returns HTTP 403, a single thread at 0.8 requests per second works. 54,551 PDFs were fetched and 1,152 are not on the FDA server. 52,123 documents are usable; 2,510 were dropped because a section was missing. 87.6% of all cited (subject, predicate) pairs have the predicate in the corpus: 93.9% of test subjects, 92.7% of dev subjects and 91.2% of train subjects have at least one.
+
+**Audit.** 19 of 23 checks pass. The one failing finding: about 76% of descriptions exceed the 256-token input budget in the predx config, so a model fine-tuned at that length would see truncated descriptions. Warnings: pair coverage 87.6% against a 90% target, and approximate token counts because the EmbeddingGemma tokenizer is gated.
 
 ## Retrieval baselines and evaluation
 
-`run_baselines.py` scores every dev and test query against the whole corpus with one method at a time, applies the candidate filter, and writes per-query ranks plus a top-100 list that later fusion runs reuse.
+`run_baselines.py` scores every dev and test query against the whole corpus with exact (brute-force) search, applies the candidate filter, and writes per-query ranks plus a top-100 list that fusion reuses.
 
 | Family | Methods | How |
 | --- | --- | --- |
-| Trivial | random, pop | pop ranks same-product-code devices by how often they were cited as predicates before the query date, recency as tie-break |
+| Trivial | random, pop | pop ranks same-product-code devices by how often the train pairs cite them, recency as tie-break |
 | Lexical | TF-IDF (1-2 grams, cosine), BM25 (bm25s + stemming), LSA (SVD-300 over TF-IDF) | fit on the corpus, no tuning |
-| Dense, local | MiniLM-L6, bge-base, e5-base, gte-modernbert, bge-m3, Qwen3-Embedding 0.6B and 4B | sentence-transformers on the 4090, 512-token limit, model-specific query prompts, vectors cached per K-number |
+| Dense, local | MiniLM-L6, bge-base, e5-base, gte-modernbert, bge-m3, Qwen3-Embedding 0.6B and 4B | sentence-transformers on an RTX 4090, 512-token limit, model-specific query prompts, vectors cached per K-number |
 | Dense, Ollama | embeddinggemma, nomic-embed-text | local Ollama server (EmbeddingGemma weights are gated on Hugging Face) |
-| Dense, API | gemini-embedding-001 (3072-d) | google-genai, retries absorb the free-tier 429s |
-| Hybrid | `rrf:a\|b` | reciprocal-rank fusion (k = 60) of two saved top-100 lists, e.g. TF-IDF with each dense model |
+| Dense, API | gemini-embedding-001 | supported by the script; not run on this build |
+| Hybrid | `rrf:a\|b` | reciprocal-rank fusion (k = 60) of two saved top-100 lists |
 
-**Candidate filtering.** A candidate must be cleared before the subject and is never the subject itself. The `+pc` variant also requires the same product code; it is scored for every method because the FDA search UI works that way.
+**Metrics.** Recall@10 (share of a query's in-corpus gold in the top 10), Hit@1, Hit@10, Hit@100, MRR, and Hit@1, Hit@10, MRR for the primary predicate alone. Gold excluded by a filter counts as not retrieved. Every number carries a 95% bootstrap interval over queries (1,000 resamples).
 
-**Metrics.** Recall@10 (share of a query's positives in the top 10), Hit@1, Hit@10, Hit@100, MRR, and the same for the primary predicate alone. Positives excluded by a filter count as not retrieved. Every number carries a 95% bootstrap interval over queries (1,000 resamples). `summarize_results.py` renders the report with breakdowns by review panel and by how many same-code candidates a query has.
+## Results
 
-**Label check.** On 100 random 2024-2026 summaries, gemma4:31b on a Spark was asked for the predicate K-numbers: the regex primary predicate agreed in 91% of summaries, and across all cited K-numbers the regex labels had precision 0.70 and recall 0.93 against the LLM. Over-inclusion is mostly reference devices and the applicant's own prior clearances, so all scores are lower bounds and the primary-only metrics are the cleanest.
+Test split, 5,308 queries. The primary columns cover the 5,173 queries whose primary predicate is in the corpus.
 
-## Results snapshot
+| Method | Recall@10 % | Hit@1 % | Hit@10 % | Hit@100 % | primary Hit@1 % | primary Hit@10 % |
+| --- | --- | --- | --- | --- | --- | --- |
+| TF-IDF | 72.6 | 49.6 | 83.1 | 96.6 | 43.9 | 78.8 |
+| RRF TF-IDF + EmbeddingGemma | 70.3 | 45.2 | 80.7 | 97.0 | 39.8 | 76.2 |
+| RRF TF-IDF + bge-m3 | 70.1 | 45.5 | 80.5 | 96.8 | 39.8 | 76.1 |
+| BM25 | 68.4 | 45.0 | 78.5 | 94.7 | 39.4 | 74.1 |
+| Qwen3-Embedding-4B | 63.0 | 37.6 | 73.1 | 94.6 | 32.8 | 68.6 |
+| bge-m3 | 62.9 | 41.3 | 73.0 | 92.0 | 36.0 | 68.6 |
+| Qwen3-Embedding-0.6B | 62.8 | 40.1 | 73.1 | 92.0 | 34.9 | 68.6 |
+| EmbeddingGemma-300M | 62.4 | 39.6 | 72.6 | 92.1 | 34.5 | 67.5 |
+| bge-base | 61.6 | 39.7 | 71.8 | 90.9 | 34.4 | 67.0 |
+| e5-base | 59.6 | 37.6 | 69.6 | 90.0 | 32.2 | 64.6 |
+| gte-modernbert | 58.2 | 38.1 | 68.5 | 87.2 | 33.0 | 63.5 |
+| nomic-embed-text | 57.9 | 37.9 | 68.0 | 88.4 | 32.6 | 62.8 |
+| LSA | 55.9 | 33.5 | 65.9 | 90.3 | 29.2 | 61.3 |
+| MiniLM-L6 | 55.2 | 35.1 | 65.2 | 85.7 | 30.2 | 59.8 |
+| Popularity | 20.0 | 5.3 | 25.1 | 68.3 | 4.2 | 20.9 |
 
-TF-IDF ties the best fusion at about 70% Recall@10 on the 4,912 test queries, and no untuned embedder beats it; the full table with intervals is in `results/REPORT.md`.
+- Lexical search wins zero-shot. TF-IDF leads every column except Hit@100; the best untuned embedder is 9.6 points behind on Recall@10.
+- The untuned embedders are close to each other: seven models sit between 57.9 and 63.0, and the 4B Qwen model does not beat bge-m3 or its own 0.6B version.
+- Fusion with TF-IDF does not beat TF-IDF alone on Recall@10 or Hit@1; it only edges it on Hit@100.
+- Primary-only Hit@10 is 4 to 5 points lower than any-gold Hit@10 for every method, and the ranking of methods is the same in both views.
+- The product-code filter lowers TF-IDF and BM25 (Recall@10 69.2 and 66.3) and makes little difference for the embedders.
+- Dev is easier than test for every method, with a similar ranking.
+- Hardest large panels for TF-IDF: physical medicine 58, orthopedic 61, dental 62. Recall@10 falls from 86 for queries with fewer than 10 earlier same-code devices to 68 with 200 or more.
 
-| Method (test, v2) | Recall@10 % | Hit@1 % | Hit@100 % |
-| --- | --- | --- | --- |
-| RRF TF-IDF + Gemini | 69.9 | 48.4 | 96.1 |
-| TF-IDF | 69.3 | 49.7 | 95.4 |
-| RRF TF-IDF + EmbeddingGemma | 69.1 | 48.4 | 96.0 |
-| BM25 | 65.4 | 47.3 | 93.3 |
-| Gemini embedding-001 | 65.1 | 45.3 | 94.2 |
-| EmbeddingGemma-300M | 62.9 | 45.4 | 93.1 |
-
-- Lexical search wins zero-shot. Predicate summaries reuse the subject's exact vocabulary (model names, standards, materials), which n-grams catch and general-purpose embeddings blur.
-- Fusion helps the tail, not the head: Hit@100 rises to 96% while Hit@1 is unchanged, so the first-stage recall for a fine-tuned reranker is already high.
-- Product-code restriction costs 2 to 4 points of Recall@10 everywhere because about a tenth of positives sit outside the subject's product code.
-- Bigger is not better untuned: Qwen3-Embedding-4B (58.1) trails MiniLM-L6 on Hit@1; the task needs domain adaptation, not scale.
-- v2 is uniformly 1.2 to 2.4 points harder than v1 for every method and the ranking is unchanged: pre-2010 predicates now count as positives, 934 scans were OCR'd, and substantial-equivalence sentences were stripped.
-- Dev and test agree within a point on every method, so dev is a trustworthy selection set for fine-tuning on the train pairs.
+The full tables with intervals, the dev split, the `+pc` variants and the per-panel breakdown are in `results/REPORT.md`.
 
 ## Reproducibility
 
-Anyone with the Drive folder and the notebook can rerun the benchmark without touching FDA servers or the original machine.
+**Colab notebook** (`notebooks/fdasearch_510k_baselines.ipynb`, generated by `scripts/make_colab.py`). It clones this repository and runs the same scripts. `DATA_SOURCE = "drive"` reads the bundle; `"fda"` runs the predx stages against FDA (`predx pilot` in quick mode, `run-all` in full). `MODE = "quick"` restricts to one review panel. EmbeddingGemma needs an `HF_TOKEN` Colab secret and Gemini a `GEMINI_API_KEY` secret; both are skipped when absent.
 
-**Colab notebook** (`notebooks/fdasearch_510k_baselines.ipynb`, generated by `scripts/make_colab.py`). The seven pipeline scripts are embedded as write-file cells, so the notebook runs the exact code behind the reported numbers and is regenerated whenever a script changes. Two switches: `DATA_SOURCE` (`drive` reads the bundle; `fda` rebuilds from openFDA and accessdata.fda.gov) and `MODE` (`quick` = one advisory committee, about 6k documents, roughly 10 minutes on a T4; `full` = all panels, 20 to 40 minutes per dense model). Dense models download from Hugging Face; EmbeddingGemma needs an `HF_TOKEN` Colab secret, Gemini a `GEMINI_API_KEY` secret, and both are skipped when absent. A final cell compares the run against the shipped reference metrics.
-
-**Data bundle** (`fdasearch_data_v2` on Drive, 670 MB, built by `bundle_build.sh`): the openFDA export, both extracted-text files gzipped, the corpus and query tables, the `predx` export, the reference metrics and report, and a `manifest.json` with a sha256 per file that the notebook verifies.
-
-**Local environment.** Windows 11 with an RTX 4090; `.venv` has CUDA torch 2.11, sentence-transformers, bm25s and RapidOCR on onnxruntime-gpu 1.22. Ollama serves embeddinggemma, embeddinggemma-2:740m and nomic-embed-text. Two DGX Spark boxes reachable over ssh run Ollama with gemma4:31b for the label check. The Gemini key lives in `.env`, which is git-ignored along with all data and run artifacts.
-
-**Repository.** The code lives under `fdasearch/` on the branch `fdasearch-baselines` of the fork keyvanazami/predicate-data-pipeline, proposed to the team repo as draft PR schukka28/predicate-data-pipeline#1; data, embedding caches, bundle and secrets are excluded.
+**Data bundle** (`fdasearch_data_v3`, 146 MB, built by `bundle_build.sh`): the predx build, `parsed.jsonl.gz`, `text_stats.jsonl`, `fetch_status.jsonl` and the metadata so `predx build` can be rerun with another mask level, the audit report, the reference metrics, and `manifest.json` with a sha256 per file that the notebook verifies.
 
 ## Limitations and next steps
 
-The labels are regex-derived and the texts are what PyMuPDF and OCR could read, so every score is a lower bound on a cleaner benchmark.
+- **Label noise.** On a 100-summary check against gemma4:31b the predx gold set has precision 0.71 and recall 0.95. Over-inclusion is mostly reference devices and the applicant's own prior clearances, so scores are lower bounds and the primary-only view is the cleanest.
+- **Fallback primaries.** 2,145 primaries are the first K-number found anywhere in a document with no predicate section. They are the least reliable labels.
+- **Coverage.** 12.4% of cited pairs point outside the corpus: no PDF on the FDA server, a statement instead of a summary, or missing sections.
+- **Token budget.** 76% of descriptions are longer than 256 tokens; decide the fine-tuning length before training.
+- **Gemini** was not run on this build.
+- **Notebook.** It has been executed locally against the bundle, not yet inside Colab itself.
 
-- **Label noise.** 9% of primary predicates and 30% of all cited K-numbers disagree with an LLM read. A cheap fix is to run the gemma4 labeller over all 7,357 dev and test summaries and keep both label sets.
-- **Name leakage.** 24% of queries still contain a predicate's device name verbatim after sentence stripping (often the applicant's own product line). Report metrics with and without those queries.
-- **Coverage.** 3% to 4% of cited predicates are outside the corpus (no PDF on the FDA server, or unreadable scans); 298 closure PDFs returned 404.
-- **Team parser.** The `predx` package is public at github.com/schukka28/predicate-data-pipeline; on 3,089 sampled 2010+ digital PDFs the two parsers pick the same primary predicate 95.9% of the time and the same gold set 81.7%; against the LLM labels predx scores precision 0.71 / recall 0.95 versus 0.70 / 0.93 here, and it finds a description for 94.8% of documents versus 80.5%, so its parser should replace this one (`results/parse_agreement.md`).
-- **Untested paths.** The notebook has not yet completed a run inside Colab itself, and the one-panel `fda` rebuild path has only run on the original machine.
-
-Next steps, in order: fine-tune bge-m3 or EmbeddingGemma on the 47,836 train pairs with hard negatives from the TF-IDF top-100 and select on dev; add a cross-encoder reranker over the fused top-100; score embeddinggemma-2:740m zero-shot as a new baseline.
-
-## Merge plan with predx
-
-predx should own the data pipeline and fdasearch should contribute only what predx lacks: GPU extraction, the dense and hybrid baselines, and the Drive-backed Colab. Everything else in fdasearch duplicates a tested predx stage and should be retired.
-
-| Stage | predx | fdasearch | Keep |
-| --- | --- | --- | --- |
-| Metadata, queues, fetch | `meta`, `plan` (pilot / subjects / closure / full), `fetch` with status log, 4 req/s, resumable | `download_pdfs.py`, `fetch_closure.py` | predx. Add a `--panel` filter to `plan`, the one thing it lacks. |
-| Text extraction | pdftotext + tesseract, 300 dpi, ~4 CPU-s per doc, never run on real FDA PDFs at scale | PyMuPDF + RapidOCR on GPU, 0.65 s per page, already run on all 49k docs | predx's on-disk format, fdasearch's engine: add a PyMuPDF/RapidOCR backend to `text_stage` (or a converter into `data/text/<yy>/K.txt.gz` + `text_stats.jsonl`). |
-| Sections and predicate labels | form-page IFU preference, section end rules, role labels with a 260-char window, 73 tests incl. 10 real PDFs | simpler regexes | predx: measured on 3,089 sampled documents it agrees with fdasearch on 95.9% of primaries, scores slightly better against the LLM labels (0.71 / 0.95 vs 0.70 / 0.93) and finds descriptions for 94.8% vs 80.5%. |
-| Dataset build | `build` + `validate` + `audit` (PASS/WARN/FAIL), device funnel, mask levels | `build_dataset.py`, `export_predx.py` | predx, configured: `splits.train` from 2010, `mask_level: strict` (equals fdasearch's SE stripping). Retire both fdasearch scripts. |
-| Baselines and metrics | BM25, popularity, random on up to 3,000 sampled test queries; Recall@k, Hit@k, MRR, nDCG, bootstrap | 16 methods incl. 9 dense, Gemini, RRF; product-code variant; primary-only metrics; all dev + test queries; per-panel report | fdasearch, reading the predx dataset (`n_candidates` as date filter, `gold_in_corpus` as positives); predx's BM25 stays as the audit sanity check. |
-| Label check | `label-sample` / `label-eval` hand labels with Wilson CIs | 100-doc LLM check (gemma4:31b) | both; feed the LLM labels through `label-eval` so one number is reported. |
-| Notebook | `predx_colab_test.ipynb` smoke tests | baselines Colab with Drive bundle | fdasearch, pointed at the predx dataset. |
-| Infrastructure | GCP Spot VM, GCS sync, optional BigQuery | local RTX 4090, two Sparks, Ollama | both: CPU stages on GCP, OCR and embeddings on the GPU boxes. |
-
-Three definitions need a team decision before the merge, because they change the numbers: train window start (2010 gives 25,847 train queries, 2015 about 20,000); whether `device_name` is part of the query text (fdasearch yes, predx no); and whether reported metrics are primary-only, all gold, or both. The first-other fallback in predx's predicate labelling should also be measured before it adds positives.
-
-The open pull request is a snapshot of fdasearch as a parallel folder; the follow-up on the same branch should delete its download, closure and build scripts once the predx backend and the dataset reader exist.
+Next: fine-tune on the 41,281 train pairs with hard negatives from the TF-IDF top-100, select on dev, and compare against the table above.

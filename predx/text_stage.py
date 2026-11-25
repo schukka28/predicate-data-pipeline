@@ -11,21 +11,33 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 
 from .io import append_jsonl, save_pages
-from .pdftext import extract_pdf
 
 log = logging.getLogger("predx.text")
 
 
+def extract_pdf(pdf, tcfg: dict) -> dict:
+    """Dispatch on text.backend: pdftotext (poppler + tesseract, default) or pymupdf (PyMuPDF + RapidOCR on GPU)."""
+    backend = tcfg.get("backend", "pdftotext")
+    if backend == "pymupdf":
+        from .pdftext_pymupdf import extract_pdf as ex
+    elif backend == "pdftotext":
+        from .pdftext import extract_pdf as ex
+    else:
+        raise ValueError(f"unknown text.backend {backend!r} (pdftotext | pymupdf)")
+    return ex(pdf, tcfg)
+
+
 def _work(args):
     k, pdf, tpath, tcfg = args
+    backend = tcfg.get("backend", "pdftotext")
     try:
         res = extract_pdf(pdf, tcfg)
         save_pages(tpath, res.pop("pages"))
         conf = res.pop("ocr_conf", [])
         return {"k": k, **res, "ocr_pages": len(res["ocr_pages"]), "ocr_conf_mean": round(sum(conf) / len(conf), 1) if conf else None,
-                "ocr_conf_min": min(conf) if conf else None, "error": None}
+                "ocr_conf_min": min(conf) if conf else None, "backend": backend, "error": None}
     except Exception as e:  # keep going; the audit reports these as text_failed
-        return {"k": k, "n_pages": 0, "n_pages_read": 0, "ocr_pages": 0, "n_chars": 0, "seconds": 0.0, "error": repr(e)[:300]}
+        return {"k": k, "n_pages": 0, "n_pages_read": 0, "ocr_pages": 0, "n_chars": 0, "seconds": 0.0, "backend": backend, "error": repr(e)[:300]}
 
 
 def run_text(cfg: dict, paths, ks, force: bool = False) -> dict:

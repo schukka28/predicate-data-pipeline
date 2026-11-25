@@ -184,7 +184,7 @@ metric below `fail_fraction` of its threshold is FAIL, otherwise WARN). Things t
 * **Splits** are by the *subject's* decision date: train 2015–2023, dev 2024, test 2025–2026. Predicates may be older than the split (that is the task), but never newer than the subject.
 * **Predicate extraction** uses a K/BK/DEN/P number finder (whitespace-tolerant, OCR-repair only if the repaired number is a known device), role hints from the nearest label ("Predicate Device", "Reference Device", "Additional predicate"), and the first-other-number rule of Wu et al. as a fallback. Reference devices are stored separately and are **not** treated as gold predicates by default.
 * **Input text never contains the answer key.** Sections end at the next heading, so predicate/comparison sections are excluded; standard masking replaces submission numbers with `[K-NUMBER]` and gold-predicate names with `[DEVICE]`; `strict` also masks distinctive name tokens and drops predicate/SE sentences. Switch with `--mask-level`; leakage is measured on the raw text and on the masked text.
-* **PDF text:** `pdftotext -layout` per page, per-page OCR (`pdftoppm` + `tesseract`) when a page has fewer than 60 alphanumerics or looks garbled (`(cid:`). Text is cached per page, so parsing rules can be iterated without repeating OCR.
+* **PDF text:** `pdftotext -layout` per page, per-page OCR (`pdftoppm` + `tesseract`) when a page has fewer than 60 alphanumerics or looks garbled (`(cid:`). Text is cached per page, so parsing rules can be iterated without repeating OCR. `--config config/pymupdf.yaml` switches to the GPU backend (`text.backend: pymupdf`: PyMuPDF text layer + RapidOCR on ONNX Runtime CUDA, no poppler/tesseract; 0.65 s per OCR'd page on an RTX 4090, same cache format).
 * **Everything is configurable** in `config/default.yaml`; `--set a.b=c` overrides one value; `--config` layers files.
 
 ## 6. Known limits — read before trusting a number
@@ -212,8 +212,8 @@ tests/     knumbers, sections, predicates, leakage, tokens/metrics, PDF round-tr
 
 ## fdasearch/ — zero-shot retrieval baselines and a Drive-backed Colab
 
-`fdasearch/` is a companion pipeline (PyMuPDF + GPU OCR extraction, closure fetch, leak-controlled dataset build
-with a `predx`-layout export) plus 16 untuned retrieval baselines (TF-IDF, BM25, LSA, nine dense embedders, Gemini,
-RRF hybrids) scored with bootstrap CIs on 49,238 510(k) summaries. See `fdasearch/README.md` for the results table
-and `fdasearch/notebooks/fdasearch_510k_baselines.ipynb` for a Colab that reruns everything from a data bundle on
-Google Drive.
+`fdasearch/` runs on top of a `predx` build: 16 untuned retrieval baselines (TF-IDF, BM25, LSA, nine dense
+embedders, Gemini, RRF hybrids) scored with bootstrap CIs on every dev and test query, a report by review panel and
+candidate-pool size, and a Colab that reruns them from a data bundle on Google Drive. It also contributes the
+`pymupdf` text backend (`predx/pdftext_pymupdf.py`, `config/pymupdf.yaml`) and `fdasearch/scripts/predx_bridge.py`,
+which drops already-downloaded PDFs into a predx data root. See `fdasearch/README.md` and `fdasearch/results/REPORT.md`.

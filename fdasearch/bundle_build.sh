@@ -1,26 +1,34 @@
+#!/usr/bin/env bash
+# Build the Drive bundle fdasearch_data_v3 (a predx build + what is needed to re-run `predx build`) in E:/fdasearch/bundle_v3.
+# Usage: bash bundle_build.sh [PREDX_DATA_ROOT]      (default E:/predx_data)
 set -e
-cd /e/fdasearch
-cp -n data/raw/device-510k.json.zip bundle/ 
-cp -n data/corpus.parquet data/queries.parquet bundle/
-[ -f bundle/extracted.jsonl.gz ] || gzip -6 -c data/extracted.jsonl > bundle/extracted.jsonl.gz
-[ -f bundle/extracted_closure.jsonl.gz ] || gzip -6 -c data/extracted_closure.jsonl > bundle/extracted_closure.jsonl.gz
-[ -f bundle/predx.zip ] || (cd data && zip -q -r ../bundle/predx.zip predx)
-for t in gemini-embedding-001 embeddinggemma BAAI__bge-m3 intfloat__e5-base-v2 Qwen__Qwen3-Embedding-0.6B nomic-embed-text; do
-  cp -n results/emb/$t.d.npz results/emb/$t.q.npz bundle/emb/
-done
-cp results/metrics.csv results/REPORT.md bundle/reference_results/
-cp data/predx/dataset_card.json bundle/reference_results/
-(cd bundle && find . -type f ! -name manifest.json -exec sha256sum {} \; > /tmp/sha.txt && ls -l $(cut -c67- /tmp/sha.txt) >/dev/null)
-python -X utf8 - <<'PY'
-import os, json, hashlib
-root="E:/fdasearch/bundle"; m=[]
-for d,_,fs in os.walk(root):
+SRC=${1:-E:/predx_data}
+OUT=/e/fdasearch/bundle_v3
+mkdir -p "$OUT/dataset" "$OUT/reports" "$OUT/reference_results"
+cp "$SRC"/dataset/*.jsonl.gz "$SRC"/dataset/dataset_card.json "$OUT/dataset/"
+cp "$SRC"/parsed.jsonl.gz "$SRC"/text_stats.jsonl "$SRC"/fetch_status.jsonl "$OUT/"
+mkdir -p "$OUT/meta" && cp "$SRC"/meta/510k.jsonl.gz "$OUT/meta/"
+cp "$SRC"/reports/audit.md "$SRC"/reports/audit.json "$OUT/reports/" 2>/dev/null || true
+cp /e/fdasearch/results/metrics.csv /e/fdasearch/results/REPORT.md "$OUT/reference_results/"
+/e/fdasearch/.venv/Scripts/python.exe -X utf8 - "$OUT" <<'PY'
+import os, sys, json, hashlib, datetime
+root = sys.argv[1]; m = []
+for d, _, fs in os.walk(root):
     for f in fs:
-        if f=="manifest.json": continue
-        p=os.path.join(d,f); rel=os.path.relpath(p,root).replace("\\","/")
-        h=hashlib.sha256(open(p,"rb").read()).hexdigest()
-        m.append(dict(path=rel,bytes=os.path.getsize(p),sha256=h))
-json.dump(dict(built="2026-11-21",dataset="fdasearch v2",files=m),open(os.path.join(root,"manifest.json"),"w"),indent=1)
-print(sum(x["bytes"] for x in m)/1e9,"GB",len(m),"files")
-for x in m: print(f'{x["bytes"]/1e6:8.1f} MB  {x["path"]}  {x["sha256"]}')
+        if f == "manifest.json":
+            continue
+        p = os.path.join(d, f); rel = os.path.relpath(p, root).replace(os.sep, "/")
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 24), b""):
+                h.update(chunk)
+        m.append(dict(path=rel, bytes=os.path.getsize(p), sha256=h.hexdigest()))
+m.sort(key=lambda x: x["path"])
+card = json.load(open(os.path.join(root, "dataset", "dataset_card.json")))
+json.dump(dict(built=datetime.date.today().isoformat(), dataset="predx build " + card["built_at"] + " (mask_level " + card["mask_level"] + ")",
+               layout="paths mirror the predx data root (paths.data_dir); reference_results/ are fdasearch's metrics on this build", files=m),
+          open(os.path.join(root, "manifest.json"), "w"), indent=1)
+print(f"{sum(x['bytes'] for x in m) / 1e6:.0f} MB, {len(m)} files")
+for x in m:
+    print(f"{x['bytes'] / 1e6:8.1f} MB  {x['path']}")
 PY

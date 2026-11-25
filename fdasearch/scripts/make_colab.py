@@ -1,12 +1,11 @@
-"""Assemble notebooks/fdasearch_510k_baselines.ipynb: a self-contained Colab that carries the pipeline scripts
-(embedded as %%writefile cells so the notebook always mirrors scripts/) and runs the top retrieval methods.
-Re-run this after changing any script or after new results land in results/metrics.csv."""
+"""Assemble notebooks/fdasearch_510k_baselines.ipynb: a Colab that clones predicate-data-pipeline (the team's predx
+pipeline plus fdasearch/), gets the data either from the Drive bundle (a predx build) or by running the predx stages
+against FDA, and runs the zero-shot retrieval baselines. Re-run after changing the scripts or when new results land
+in results/metrics.csv (the intro table is read from there)."""
 import os, json, textwrap
 import pandas as pd
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPTS = ["download_pdfs.py", "extract_text.py", "build_dataset.py", "fetch_closure.py",
-           "run_baselines.py", "summarize_results.py", "export_predx.py"]
 OUT = os.path.join(ROOT, "notebooks", "fdasearch_510k_baselines.ipynb")
 
 
@@ -22,7 +21,7 @@ def results_table():
     """Top methods on the test split from the local full run, for the intro cell."""
     f = os.path.join(ROOT, "results", "metrics.csv")
     if not os.path.exists(f):
-        return "(run results/metrics.csv not found when the notebook was generated)"
+        return "(results/metrics.csv not found when the notebook was generated)"
     m = pd.read_csv(f).drop_duplicates(["method", "split"], keep="last")
     m = m[(m.split == "test") & ~m.method.str.endswith("+pc")].sort_values("recall10", ascending=False)
     show = ["tfidf", "rrf:tfidf|gemini_gemini-embedding-001", "rrf:tfidf|ollama_embeddinggemma", "bm25",
@@ -47,50 +46,56 @@ cells.append(md(f"""
 # Zero-shot predicate retrieval for FDA 510(k) devices
 
 Given a new device's **Indications for Use + Device Description**, rank earlier 510(k) clearances so that the
-predicates its summary cites come first. This notebook rebuilds the dataset from public FDA records and runs the
-untuned retrieval baselines (lexical, dense embeddings, hybrids). COMS 4705 project: *Retrieving 510(k) Predicate
-Devices with Fine-Tuned Text Embeddings* (K. Azami, J. Lamm, S. Chukka).
+predicates its summary cites come first. This notebook runs the untuned retrieval baselines (lexical, dense
+embeddings, hybrids) on the dataset built by the team's `predx` pipeline. COMS 4705 project: *Retrieving 510(k)
+Predicate Devices with Fine-Tuned Text Embeddings* (K. Azami, J. Lamm, S. Chukka).
 
-**Pipeline** (each stage is resumable; re-run a cell after a disconnect and it skips finished work)
+**Pipeline** (`predx`, github.com/schukka28/predicate-data-pipeline; every stage is resumable)
 
-1. openFDA 510(k) metadata (176k records) -> summary PDFs from accessdata.fda.gov
-2. PyMuPDF text extraction, optional GPU OCR for image-only scans; regex section headers; cited K-numbers with predicate/reference labels
-3. optional *closure fetch*: cited predicates older than the corpus window are downloaded too
-4. dataset: K-numbers masked, substantial-equivalence sentences stripped; train 2010-2023 / dev 2024 / test 2025+
-5. baselines + metrics (Recall@10, Hit@k, MRR with bootstrap CIs); report by review panel and candidate-pool size
+1. `meta`: openFDA 510(k) metadata (176k records); `plan` + `fetch`: summary PDFs from accessdata.fda.gov
+2. `text`: per-page text. Backend `pymupdf` = PyMuPDF text layer + RapidOCR on the GPU for image-only pages
+   (`config/pymupdf.yaml`); the default backend is poppler + tesseract
+3. `parse`: section headings (Indications for Use, Device Description) and cited K-numbers with predicate /
+   reference roles; `build`: K-numbers and predicate names masked, train 2015-2023 / dev 2024 / test 2025+,
+   gold = primary + additional predicates present in the corpus; `validate` + `audit`
+4. `fdasearch/scripts/run_baselines.py`: baselines + metrics (Recall@10, Hit@k, MRR with bootstrap CIs; primary-only
+   columns as a secondary view); `summarize_results.py`: report by review panel and candidate-pool size
 
-**Data source.** `DATA_SOURCE = "drive"` (default) is hermetic with respect to data: it reads the prebuilt v2
-bundle (`fdasearch_data_v2` on Google Drive, 670 MB: openFDA export, extracted PDF text incl. OCR and closure docs,
-the corpus/query tables and the `predx` export, sha256-verified against `manifest.json`), so nothing is fetched from
-FDA and the dataset is byte-identical to the reference run. Models are still downloaded from Hugging Face and
-embedded on the Colab GPU (Gemini via the API). `DATA_SOURCE = "fda"` rebuilds the data from openFDA and
-accessdata.fda.gov instead.
+**Data source.** `DATA_SOURCE = "drive"` (default) is hermetic with respect to data: it reads the prebuilt bundle
+(`fdasearch_data_v3` on Google Drive: the predx build `data/dataset/`, the parsed records so `build` can be re-run
+with another mask level, the audit report and the reference metrics; every file sha256-verified against
+`manifest.json`). Nothing is fetched from FDA and the dataset is byte-identical to the reference run. Models are still
+downloaded from Hugging Face and embedded on the Colab GPU (Gemini via the API). `DATA_SOURCE = "fda"` runs the
+predx stages against openFDA and accessdata.fda.gov instead.
 
-**Two modes.** `quick` restricts everything to one advisory committee (default Cardiovascular, ~6k documents;
-about 10 minutes on a T4 from the bundle, ~15 minutes more when rebuilding). `full` uses all panels (~49k documents;
-lexical methods in minutes, each dense model 20-40 minutes on a T4, hours more when rebuilding from FDA).
+**Two modes.** `quick` restricts everything to one advisory committee (default Cardiovascular; a few minutes on a T4
+from the bundle; with `fda` it runs `predx pilot`, a stratified sample of `PILOT_N` subjects plus the predicates they
+cite, about 20 minutes). `full` uses all panels (~49k documents; lexical methods in minutes, each dense model 20-40
+minutes on a T4, hours more when fetching from FDA).
 
 **Reference results from the full run on an RTX 4090** (same code; numbers in a quick run differ because the
 candidate pool is one panel):
 
 {results_table()}
 
-Lexical search wins zero-shot; EmbeddingGemma and Gemini are the best untuned embedders; fusion helps Hit@100.
+Lexical search wins zero-shot (TF-IDF, then BM25); the untuned embedders (Qwen3, bge-m3, EmbeddingGemma) sit 9-10 points
+lower on Recall@10; rank fusion with TF-IDF matches TF-IDF on Hit@100 but not on Recall@10. Gemini was not run on this build.
 About 9% of the regex "primary predicate" labels disagree with an LLM read of the summary, so all scores are lower bounds.
 """))
 
 cells.append(md("## 0. Settings"))
 cells.append(code("""
-DATA_SOURCE = "drive"       # "drive" = prebuilt v2 bundle from Google Drive (hermetic); "fda" = rebuild from FDA downloads
-DATA_DIR    = "/content/drive/MyDrive/fdasearch_data_v2"   # bundle location after drive.mount (if it was shared with you: Drive > Organize > Add shortcut to My Drive)
-DATA_FOLDER_ID = "1Ac0fRIa2dSDRngPj8Pql8eduyMIQY6bk"        # fallback: fetch the folder by id with gdown (needs "anyone with the link" sharing)
+REPO_URL   = "https://github.com/keyvanazami/predicate-data-pipeline"   # predx + fdasearch/ (fork branch; use schukka28/... main once merged)
+REPO_REF   = "fdasearch-predx"                                           # branch, tag or commit to check out
+
+DATA_SOURCE = "drive"       # "drive" = prebuilt predx build from Google Drive (hermetic); "fda" = run the predx stages against FDA
+DATA_DIR    = "/content/drive/MyDrive/fdasearch_data_v3"   # bundle location after drive.mount (if it was shared with you: Drive > Organize > Add shortcut to My Drive)
+DATA_FOLDER_ID = ""                                         # fallback: fetch the folder by id with gdown (needs "anyone with the link" sharing)
+MASK_LEVEL  = None          # None = use the shipped build; "standard" | "strict" | "none" = re-run `predx build` from the parsed records
 
 MODE       = "quick"        # "quick" = one advisory committee; "full" = all panels
 PANEL      = "CV"           # quick mode only. Codes: OR Orthopedic, RA Radiology, CV Cardiovascular, SU Surgery, DE Dental, HO Hospital, GU Gastro/Urology, NE Neurology, ...
-MIN_YEAR   = 2010           # corpus window start (summaries before ~2000 are mostly scans)
-RUN_CLOSURE = True          # fda source only: also fetch cited predicates outside the window so they become retrievable
-RUN_OCR    = False          # fda source only: OCR image-only PDFs (needs a GPU runtime; ~0.7 s/page on T4, ~7 s/page on CPU)
-WORKERS    = 2              # extraction processes (free Colab has 2 vCPUs)
+PILOT_N    = 400            # fda + quick: number of subjects in the pilot sample (predx plan --stage pilot)
 
 # Dense models, downloaded from Hugging Face and run on the Colab GPU. EmbeddingGemma is gated: accept the license at
 # https://huggingface.co/google/embeddinggemma-300m and put a token in Colab secrets as HF_TOKEN.
@@ -112,13 +117,10 @@ print("HF token:", "yes" if HF_TOKEN else "no (EmbeddingGemma will be skipped)",
 
 cells.append(md("## 1. Environment"))
 cells.append(code("""
-%pip install -q "pymupdf>=1.24" "pandas>=2.2" pyarrow "bm25s>=0.2" PyStemmer "scikit-learn>=1.4" "sentence-transformers>=5.0" "transformers>=4.56" google-genai requests
-if RUN_OCR:
+%pip install -q "pymupdf>=1.24" "pandas>=2.2" "bm25s>=0.2" PyStemmer "scikit-learn>=1.4" "sentence-transformers>=5.0" "transformers>=4.56" google-genai requests pyyaml pypdf
+if DATA_SOURCE == "fda":
     %pip install -q rapidocr-onnxruntime onnxruntime-gpu
 import os, sys, json, glob, subprocess, pathlib
-ROOT = pathlib.Path("/content/fdasearch"); (ROOT / "scripts").mkdir(parents=True, exist_ok=True)
-for d in ["data/raw", "data/pdfs", "results"]: (ROOT / d).mkdir(parents=True, exist_ok=True)
-os.chdir(ROOT)
 def sh(cmd):
     # run a shell command and stream its output into the cell (Colab does not reliably show inherited stdio)
     print("$", cmd, flush=True)
@@ -129,29 +131,28 @@ def sh(cmd):
         print(line, end="", flush=True); tail.append(line); tail = tail[-40:]
     if p.wait():
         raise RuntimeError(f"command failed ({p.returncode}); last lines:\\n" + "".join(tail[-15:]))
+ROOT = pathlib.Path("/content/predicate-data-pipeline")
+if not (ROOT / "predx").exists():
+    sh(f"git clone --quiet {REPO_URL} {ROOT}")
+os.chdir(ROOT)
+sh(f"git checkout --quiet {REPO_REF} && git log --oneline -1")
+for d in ["data", "fdasearch/results"]: (ROOT / d).mkdir(parents=True, exist_ok=True)
 import torch; print("python", sys.version.split()[0], "| GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
 """))
 
 cells.append(md("""
-## 2. Pipeline scripts
-The cells below write the project's scripts into `/content/fdasearch/scripts/`. They are the exact files used for
-the reference results (generated from the repo by `scripts/make_colab.py`).
-"""))
-for name in SCRIPTS:
-    src = open(os.path.join(ROOT, "scripts", name), encoding="utf-8").read()
-    cells.append(code(f"%%writefile scripts/{name}\n{src}"))
-
-cells.append(md("""
-## 3. Data
+## 2. Data
 **drive**: the bundle is copied from Drive (mounted, or fetched by folder id), every file is checked against the
-sha256 in `manifest.json` and the extracted text is unpacked. In `quick` mode the dataset is rebuilt for one panel
-from the extracted text (no PDFs needed); in `full` mode the shipped corpus/query tables are used as they are.
+sha256 in `manifest.json`, and `data/dataset/` is the predx build as shipped (or rebuilt from the parsed records when
+`MASK_LEVEL` is set). In `quick` mode the baselines restrict the corpus and the queries to one panel.
 
-**fda**: the downloader sends an identifying research User-Agent (FDA's server rejects anonymous clients) and runs
-at ~25 PDFs/s with 6 workers. ~0.6% of summaries have no PDF (404).
+**fda**: `quick` runs `predx pilot` (metadata, a stratified sample of subjects from one panel, fetch, text with the
+GPU backend, parse, the predicates they cite, build, audit). `full` runs `predx run-all`. The fetch stage sends an
+identifying User-Agent (set `CONTACT_EMAIL` if you want your address in it) and rate-limits itself.
 """))
 cells.append(code("""
-import hashlib, shutil, gzip, zipfile
+import hashlib, shutil
+PREDX = f"python -m predx.cli --config config/pymupdf.yaml"
 panel_arg = f"--panel {PANEL}" if MODE == "quick" else ""
 
 def fetch_bundle():
@@ -163,16 +164,13 @@ def fetch_bundle():
             print("Drive mount not available:", e)
     if not src.exists() and DATA_FOLDER_ID:
         sh("pip install -q gdown")
-        src = pathlib.Path("/content/fdasearch_data_v2")
+        src = pathlib.Path("/content/fdasearch_data_v3")
         sh(f"gdown --folder https://drive.google.com/drive/folders/{DATA_FOLDER_ID} -O {src}")
-    assert (src / "manifest.json").exists(), f"bundle not found at {src}: mount Drive with fdasearch_data_v2 in My Drive, or set DATA_FOLDER_ID"
+    assert (src / "manifest.json").exists(), f"bundle not found at {src}: mount Drive with fdasearch_data_v3 in My Drive, or set DATA_FOLDER_ID"
     man = json.load(open(src / "manifest.json"))
-    place = {"device-510k.json.zip": "data/raw/device-510k.json.zip", "extracted.jsonl.gz": "data/extracted.jsonl.gz",
-             "extracted_closure.jsonl.gz": "data/extracted_closure.jsonl.gz", "corpus.parquet": "data/corpus_v2.parquet",
-             "queries.parquet": "data/queries_v2.parquet", "predx.zip": "data/predx_v2.zip"}
     for f in man["files"]:
-        rel = f["path"]
-        dst = ROOT / (place.get(rel) or ("results/emb/" + rel[4:] if rel.startswith("emb/") else "results/reference/" + rel.split("/")[-1] if rel.startswith("reference_results/") else rel))
+        rel = f["path"]      # paths inside the bundle mirror the predx data root; reference_results/ goes to fdasearch/results/reference/
+        dst = ROOT / ("fdasearch/results/reference/" + rel.split("/", 1)[1] if rel.startswith("reference_results/") else "data/" + rel)
         if dst.exists() and dst.stat().st_size == f["bytes"]:
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -182,47 +180,27 @@ def fetch_bundle():
         with open(dst, "rb") as fh:
             for chunk in iter(lambda: fh.read(1 << 24), b""): h.update(chunk)
         assert h.hexdigest() == f["sha256"], f"checksum mismatch for {rel}"
-    for gz in ["data/extracted.jsonl.gz", "data/extracted_closure.jsonl.gz"]:
-        out = ROOT / gz[:-3]
-        if not out.exists():
-            with gzip.open(ROOT / gz, "rb") as fi, open(out, "wb") as fo: shutil.copyfileobj(fi, fo, 1 << 24)
-    if MODE == "quick":
-        sh(f"python scripts/build_dataset.py {panel_arg}")
-    else:
-        shutil.copyfile(ROOT / "data/corpus_v2.parquet", ROOT / "data/corpus.parquet")
-        shutil.copyfile(ROOT / "data/queries_v2.parquet", ROOT / "data/queries.parquet")
+    if MASK_LEVEL:
+        sh(f"{PREDX} build --mask-level {MASK_LEVEL}")
+        sh(f"{PREDX} validate")
     print("bundle ready")
 
 if DATA_SOURCE == "drive":
     fetch_bundle()
+elif MODE == "quick":
+    sh(f"{PREDX} pilot --panel {PANEL} --n {PILOT_N} --no-tokenizers")
+    panel_arg = ""     # the pilot build is already one panel
 else:
-    sh(f"python scripts/download_pdfs.py --min-year {MIN_YEAR} --workers 6 {panel_arg}")
-    sh(f"python scripts/extract_text.py --workers {WORKERS}")
-    if RUN_OCR:
-        sh("python scripts/extract_text.py --ocr --workers 1 --redo-low-text")
-    sh(f"python scripts/build_dataset.py {panel_arg}")
-"""))
-cells.append(md("""
-### 3b. Closure fetch (fda source only)
-The bundle already contains the closure documents. When rebuilding from FDA, predicates cited by the queries but outside the window (mostly 2000s clearances) are downloaded and extracted,
-then the dataset is rebuilt so they count as retrievable positives. Older PDFs are often scans: without OCR,
-about half of them yield no text and stay unretrievable.
-"""))
-cells.append(code("""
-if RUN_CLOSURE and DATA_SOURCE == "fda":
-    sh("python scripts/fetch_closure.py")
-    ocr = "--ocr --workers 1" if RUN_OCR else f"--workers {WORKERS}"
-    sh(f"python scripts/extract_text.py {ocr} --pdf-dir data/pdfs_closure --out data/extracted_closure.jsonl")
-    sh(f"python scripts/build_dataset.py {panel_arg}")
-import pandas as pd
-q = pd.read_parquet("data/queries.parquet"); c = pd.read_parquet("data/corpus.parquet")
-print(f"corpus {len(c)} docs {c.date.min()}..{c.date.max()} | queries", q.split.value_counts().to_dict())
+    sh(f"{PREDX} run-all --no-tokenizers")
+card = json.load(open("data/dataset/dataset_card.json"))
+print("predx build:", card["built_at"], "| mask_level", card["mask_level"], "| corpus", card["n_corpus"], "| queries", {k: v for k, v in card["counts"].items() if k.endswith("retrievable")})
 """))
 
 cells.append(md("""
-## 4. Baselines
-Candidates for each query are the corpus documents cleared before the subject. `--pc` additionally scores each
-method restricted to the subject's product code. Embeddings are cached per K-number in `results/emb/`.
+## 3. Baselines
+Candidates for each query are the corpus documents cleared before the subject (`n_candidates` in the predx build);
+gold = every cited predicate that is in the corpus. `--pc` additionally scores each method restricted to the
+subject's product code. Embeddings are cached per K-number in `fdasearch/results/emb/`.
 """))
 cells.append(code("""
 if HF_TOKEN:
@@ -230,46 +208,49 @@ if HF_TOKEN:
     from huggingface_hub import login; login(token=HF_TOKEN)
 import transformers; print("transformers", transformers.__version__, "(EmbeddingGemma needs >= 4.56)")
 if GEMINI_API_KEY:
-    open(".env", "w").write(f"GEMINI_API_KEY={GEMINI_API_KEY}\\n")
+    open("fdasearch/.env", "w").write(f"GEMINI_API_KEY={GEMINI_API_KEY}\\n")
+for stale in ["fdasearch/results/metrics.csv", "fdasearch/results/REPORT.md"]:   # the repo ships the full-run numbers; start this run clean
+    if os.path.exists(stale): os.remove(stale)
+BASE = f"python fdasearch/scripts/run_baselines.py --dataset data/dataset {panel_arg}"
 
-sh("python scripts/run_baselines.py --pc --methods random,pop,bm25,tfidf,lsa")
+sh(f"{BASE} --pc --methods random,pop,bm25,tfidf,lsa")
 dense_specs = ["emb:" + m for m in EMBED_MODELS if HF_TOKEN or "gemma" not in m]
 if RUN_GEMINI and GEMINI_API_KEY:
     dense_specs.append("gemini:gemini-embedding-001")
 if dense_specs:
-    sh("python scripts/run_baselines.py --pc --methods " + ",".join(dense_specs))
+    sh(f"{BASE} --pc --methods " + ",".join(dense_specs))
 """))
 cells.append(md("""
-### 4b. Hybrids
-Reciprocal-rank fusion of the saved top-100 lists (`rrf:a|b`; names are the sanitized method names in `results/top/`).
+### 3b. Hybrids
+Reciprocal-rank fusion of the saved top-100 lists (`rrf:a|b`; names are the sanitized method names in `fdasearch/results/top/`).
 """))
 cells.append(code("""
 import re
 tags = [re.sub(r"[^A-Za-z0-9_.+-]", "_", m.replace("/", "__")) for m in dense_specs]      # e.g. emb_google__embeddinggemma-300m, gemini_gemini-embedding-001
 fusions = [f"rrf:tfidf|{t}" for t in tags] + [f"rrf:bm25|{t}" for t in tags[:1]]
 if fusions:
-    sh('python scripts/run_baselines.py --methods "' + ",".join(fusions) + '"')
+    sh(f'{BASE} --methods "' + ",".join(fusions) + '"')
 """))
 
-cells.append(md("## 5. Report"))
+cells.append(md("## 4. Report"))
 cells.append(code("""
-sh("python scripts/summarize_results.py > /dev/null")
+sh(f"python fdasearch/scripts/summarize_results.py --dataset data/dataset {panel_arg} > /dev/null")
 from IPython.display import Markdown, display
-display(Markdown(open("results/REPORT.md").read()))
+display(Markdown(open("fdasearch/results/REPORT.md").read()))
 """))
 cells.append(md("""
 ### Reproducibility check
-With `DATA_SOURCE="drive"` and `MODE="full"` the lexical methods must match the reference run to the fourth decimal
-(same texts, same code); dense models re-embedded here should land within a few tenths of a point (GPU/batch
-nondeterminism). The reference EmbeddingGemma run went through Ollama (`ollama:embeddinggemma`), so it has no
-direct counterpart. In `quick` mode the pool is one panel, so numbers differ by design.
+With `DATA_SOURCE="drive"`, `MODE="full"` and `MASK_LEVEL=None` the lexical methods must match the reference run to
+the fourth decimal (same texts, same code); dense models re-embedded here should land within a few tenths of a point
+(GPU/batch nondeterminism). The reference EmbeddingGemma run went through Ollama (`ollama:embeddinggemma`), so it
+has no direct counterpart. In `quick` mode the pool is one panel, so numbers differ by design.
 """))
 cells.append(code("""
 import pandas as pd
-ref = "results/reference/metrics.csv"
+ref = "fdasearch/results/reference/metrics.csv"
 if os.path.exists(ref):
-    a = pd.read_csv("results/metrics.csv").drop_duplicates(["method", "split"], keep="last").set_index(["method", "split"])
-    b = pd.read_csv(ref).set_index(["method", "split"])
+    a = pd.read_csv("fdasearch/results/metrics.csv").drop_duplicates(["method", "split"], keep="last").set_index(["method", "split"])
+    b = pd.read_csv(ref).drop_duplicates(["method", "split"], keep="last").set_index(["method", "split"])
     common = a.index.intersection(b.index)
     cmp = pd.DataFrame({"this_run": a.loc[common, "recall10"], "reference": b.loc[common, "recall10"]})
     cmp["diff"] = (cmp.this_run - cmp.reference).round(4)
@@ -278,37 +259,34 @@ if os.path.exists(ref):
 """))
 cells.append(md("""
 ### Look at one query
-What the model sees (K-numbers masked, substantial-equivalence sentences removed), the cited predicates, and the
+What the model sees (K-numbers and predicate names masked by `predx build`), the cited predicates, and the
 TF-IDF top 10.
 """))
 cells.append(code("""
-import json, numpy as np
-q = pd.read_parquet("data/queries.parquet"); c = pd.read_parquet("data/corpus.parquet")
-qt = q[q.split == "test"].reset_index(drop=True)
-top = np.load("results/top/tfidf.npy")                      # rows follow the dev+test query order used by run_baselines
-qd = q[q.split.isin(["dev", "test"])].reset_index(drop=True)
-i = int(qd.index[qd.split == "test"][0])                    # first test query; change i to browse
-r = qd.iloc[i]
-print(r.k, r.date, r.product_code, "|", r.panel); print(r.query[:600], "...\\n")
-print("cited predicates:", list(r.predicates_all), "| primary:", r.primary)
+import numpy as np
+sys.path.insert(0, "fdasearch/scripts")
+from predx_dataset import load_dataset
+c, q, pairs, card = load_dataset("data/dataset", panel=PANEL if panel_arg else None)
+top = np.load("fdasearch/results/top/tfidf.npy")           # rows follow the dev+test query order used by run_baselines
+i = int(q.index[q.split == "test"][0])                      # first test query; change i to browse
+r = q.iloc[i]
+print(r.k, r.date, r.product_code, "|", r.panel, "| candidates:", r.n_candidates); print(r.query[:600], "...\\n")
+print("gold in corpus:", r.positives, "| primary:", r.primary, "| cited in total:", r.n_gold)
 for rank, j in enumerate(top[i][:10], 1):
     d = c.iloc[j]; mark = "<-- predicate" if d.k in set(r.positives) else ""
     print(f"{rank:2d}. {d.k} {d.date} {d.product_code} {d.device_name[:60]} {mark}")
 """))
 
 cells.append(md("""
-## 6. Keep the results
-Zips the metrics, report, per-query ranks and the dataset in the team's `predx` layout (`data/predx/`).
-Mount Drive first if you want them to survive the runtime.
+## 5. Keep the results
+Zips the metrics, report, per-query ranks and the dataset card. Mount Drive first if you want them to survive the runtime.
 """))
 cells.append(code("""
-sh("python scripts/export_predx.py")
-import shutil, zipfile
+import zipfile
 with zipfile.ZipFile("/content/fdasearch_results.zip", "w", zipfile.ZIP_DEFLATED) as z:
-    for p in ["results/metrics.csv", "results/REPORT.md", "data/dataset_card.json"]:
+    for p in ["fdasearch/results/metrics.csv", "fdasearch/results/REPORT.md", "data/dataset/dataset_card.json", "data/reports/audit.md"]:
         if os.path.exists(p): z.write(p)
-    for d in ["results/ranks", "data/predx"]:
-        for f in glob.glob(d + "/*"): z.write(f)
+    for f in glob.glob("fdasearch/results/ranks/*"): z.write(f)
 print("/content/fdasearch_results.zip", f"{os.path.getsize('/content/fdasearch_results.zip')/1e6:.1f} MB")
 try:
     from google.colab import files; files.download("/content/fdasearch_results.zip")

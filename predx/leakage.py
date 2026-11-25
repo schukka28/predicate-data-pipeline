@@ -27,10 +27,14 @@ _PRED_SENT = re.compile(r"predicate|substantial(?:ly)?\s+equivalen|equivalent\s+
 
 
 def mask_k_numbers(text: str, repl: str = K_TOKEN):
-    hits = find_knumbers(text, known=None, accept_unverified_ocr=True)
-    for h in sorted(hits, key=lambda h: -h.start):
-        text = text[: h.start] + repl + text[h.end:]
-    return text, len(hits)
+    n = 0
+    while True:  # a second pass catches numbers glued to a previous one ("K140833K140833"), which the lookbehind skips
+        hits = find_knumbers(text, known=None, accept_unverified_ocr=True)
+        if not hits:
+            return text, n
+        for h in sorted(hits, key=lambda h: -h.start):
+            text = text[: h.start] + repl + text[h.end:]
+        n += len(hits)
 
 
 def _norm_name(n: str) -> str:
